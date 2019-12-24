@@ -10,17 +10,20 @@ from time import sleep
 
 from cv2 import imwrite  # pylint:disable=no-name-in-module
 import numpy as np
+import tensorflow as tf
+from keras.backend.tensorflow_backend import set_session
 from tqdm import tqdm
 
 from scripts.fsmedia import Alignments, Images, PostProcess, Utils
-from lib import Serializer
+from lib.serializer import get_serializer
 from lib.convert import Converter
 from lib.faces_detect import DetectedFace
 from lib.gpu_stats import GPUStats
+from lib.image import read_image_hash
 from lib.multithreading import MultiThread, total_cpus
 from lib.queue_manager import queue_manager
-from lib.utils import FaceswapError, get_folder, get_image_paths, hash_image_file
-from plugins.extract.pipeline import Extractor
+from lib.utils import FaceswapError, get_folder, get_image_paths
+from plugins.extract.pipeline import Extractor, ExtractMedia
 from plugins.plugin_loader import PluginLoader
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -31,14 +34,11 @@ class Convert():
     def __init__(self, arguments):
         logger.debug("Initializing %s: (args: %s)", self.__class__.__name__, arguments)
         self.args = arguments
-        Utils.set_verbosity(self.args.loglevel)
 
         self.patch_threads = None
         self.images = Images(self.args)
         self.validate()
         self.alignments = Alignments(self.args, False, self.images.is_video)
-        # Update Legacy alignments
-        Legacy(self.alignments, self.images.input_images, arguments.input_aligned_dir)
         self.opts = OptionalActions(self.args, self.images.input_images, self.alignments)
 
         self.add_queues()
@@ -58,7 +58,7 @@ class Convert():
 
     @property
     def queue_size(self):
-        """ Set 16 for singleprocess otherwise 32 """
+        """ Set 16 for single process otherwise 32 """
         if self.args.singleprocess:
             retval = 16
         else:
@@ -131,6 +131,9 @@ class Convert():
             if self.disk_io.completion_event.is_set():
                 logger.debug("DiskIO completion event set. Joining Pool")
                 break
+            if self.patch_threads.completed():
+                logger.debug("All patch threads completed")
+                break
             sleep(1)
         self.patch_threads.join()
 
@@ -200,7 +203,7 @@ class DiskIO():
         logger.debug(retval)
         return retval
 
-    # Initalization
+    # Initialization
     def get_writer(self):
         """ Return the writer plugin """
         args = [self.args.output_dir]
@@ -256,7 +259,8 @@ class DiskIO():
                        "superior results")
         extractor = Extractor(detector="cv2-dnn",
                               aligner="cv2-dnn",
-                              multiprocess=False,
+                              masker="none",
+                              multiprocess=True,
                               rotate_images=None,
                               min_size=20)
         extractor.launch()
@@ -306,7 +310,7 @@ class DiskIO():
                 logger.debug("Load Queue: Stop signal received. Terminating")
                 break
             if image is None or (not image.any() and image.ndim not in (2, 3)):
-                # All black frames will return not np.any() so check dims too
+                # All black frames will return not numpy.any() so check dims too
                 logger.warning("Unable to open image. Skipping: '%s'", filename)
                 continue
             if self.check_skipframe(filename):
@@ -375,12 +379,10 @@ class DiskIO():
 
     def detect_faces(self, filename, image):
         """ Extract the face from a frame (If alignments file not found) """
-        inp = {"filename": filename,
-               "image": image}
-        self.extractor.input_queue.put(inp)
+        self.extractor.input_queue.put(ExtractMedia(filename, image))
         faces = next(self.extractor.detected_faces())
 
-        final_faces = [face for face in faces["detected_faces"]]
+        final_faces = [face for face in faces.detected_faces]
         return final_faces
 
     # Saving tasks
@@ -418,9 +420,13 @@ class Predict():
         self.args = arguments
         self.in_queue = in_queue
         self.out_queue = queue_manager.get_queue("patch")
-        self.serializer = Serializer.get_serializer("json")
+        self.serializer = get_serializer("json")
         self.faces_count = 0
         self.verify_output = False
+
+        if arguments.allow_growth:
+            self.set_tf_allow_growth()
+
         self.model = self.load_model()
         self.output_indices = {"face": self.model.largest_face_index,
                                "mask": self.model.largest_mask_index}
@@ -455,7 +461,7 @@ class Predict():
     @property
     def has_predicted_mask(self):
         """ Return whether this model has a predicted mask """
-        return bool(self.model.state.mask_shapes)
+        return bool(self.model.state.config.get("learn_mask", False))
 
     @staticmethod
     def get_batchsize(queue_size):
@@ -467,6 +473,18 @@ class Predict():
         logger.debug("Batchsize: %s", batchsize)
         logger.debug("Got batchsize: %s", batchsize)
         return batchsize
+
+    @staticmethod
+    def set_tf_allow_growth():
+        """ Allow TensorFlow to manage VRAM growth """
+        # pylint: disable=no-member
+        # TODO Move this temporary fix somewhere more appropriate
+        logger.debug("Setting Tensorflow 'allow_growth' option")
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        config.gpu_options.visible_device_list = "0"
+        set_session(tf.Session(config=config))
+        logger.debug("Set Tensorflow 'allow_growth' option")
 
     def load_model(self):
         """ Load the model requested for conversion """
@@ -494,9 +512,8 @@ class Predict():
                                 "option.".format(len(statefile)))
         statefile = os.path.join(str(model_dir), statefile[0])
 
-        with open(statefile, "rb") as inp:
-            state = self.serializer.unmarshal(inp.read().decode("utf-8"))
-            trainer = state.get("name", None)
+        state = self.serializer.load(statefile)
+        trainer = state.get("name", None)
 
         if not trainer:
             raise FaceswapError("Trainer name could not be read from state file. "
@@ -586,7 +603,8 @@ class Predict():
     def compile_feed_faces(detected_faces):
         """ Compile the faces for feeding into the predictor """
         logger.trace("Compiling feed face. Batchsize: %s", len(detected_faces))
-        feed_faces = np.stack([detected_face.feed_face for detected_face in detected_faces])
+        feed_faces = np.stack([detected_face.feed_face[..., :3]
+                               for detected_face in detected_faces]) / 255.0
         logger.trace("Compiled Feed faces. Shape: %s", feed_faces.shape)
         return feed_faces
 
@@ -594,7 +612,7 @@ class Predict():
         """ Perform inference on the feed """
         logger.trace("Predicting: Batchsize: %s", len(feed_faces))
         feed = [feed_faces]
-        if self.has_predicted_mask:
+        if self.model.feed_mask:
             feed.append(np.repeat(self.input_mask, feed_faces.shape[0], axis=0))
         logger.trace("Input shape(s): %s", [item.shape for item in feed])
 
@@ -682,7 +700,7 @@ class OptionalActions():
             file_list = [path for path in get_image_paths(input_aligned_dir)]
             logger.info("Getting Face Hashes for selected Aligned Images")
             for face in tqdm(file_list, desc="Hashing Faces"):
-                face_hashes.append(hash_image_file(face))
+                face_hashes.append(read_image_hash(face))
             logger.debug("Face Hashes: %s", (len(face_hashes)))
             if not face_hashes:
                 raise FaceswapError("Aligned directory is empty, no faces will be converted!")
@@ -690,61 +708,3 @@ class OptionalActions():
                 logger.warning("Aligned directory contains far fewer images than the input "
                                "directory, are you sure this is the right folder?")
         return face_hashes
-
-
-class Legacy():
-    """ Update legacy alignments:
-        - Rotate landmarks and bounding boxes on legacy alignments
-          and remove the 'r' parameter
-        - Add face hashes to alignments file
-        """
-    def __init__(self, alignments, frames, faces_dir):
-        self.alignments = alignments
-        self.frames = {os.path.basename(frame): frame
-                       for frame in frames}
-        self.process(faces_dir)
-
-    def process(self, faces_dir):
-        """ Run the rotate alignments process """
-        rotated = self.alignments.get_legacy_rotation()
-        hashes = self.alignments.get_legacy_no_hashes()
-        if not rotated and not hashes:
-            return
-        if rotated:
-            logger.info("Legacy rotated frames found. Converting...")
-            self.rotate_landmarks(rotated)
-            self.alignments.save()
-        if hashes and faces_dir:
-            logger.info("Legacy alignments found. Adding Face Hashes...")
-            self.add_hashes(hashes, faces_dir)
-            self.alignments.save()
-
-    def rotate_landmarks(self, rotated):
-        """ Rotate the landmarks """
-        for rotate_item in tqdm(rotated, desc="Rotating Landmarks"):
-            frame = self.frames.get(rotate_item, None)
-            if frame is None:
-                logger.debug("Skipping missing frame: '%s'", rotate_item)
-                continue
-            self.alignments.rotate_existing_landmarks(rotate_item, frame)
-
-    def add_hashes(self, hashes, faces_dir):
-        """ Add Face Hashes to the alignments file """
-        all_faces = dict()
-        face_files = sorted(face for face in os.listdir(faces_dir) if "_" in face)
-        for face in face_files:
-            filename, extension = os.path.splitext(face)
-            index = filename[filename.rfind("_") + 1:]
-            if not index.isdigit():
-                continue
-            orig_frame = filename[:filename.rfind("_")] + extension
-            all_faces.setdefault(orig_frame, dict())[int(index)] = os.path.join(faces_dir, face)
-
-        for frame in tqdm(hashes):
-            if frame not in all_faces.keys():
-                logger.warning("Skipping missing frame: '%s'", frame)
-                continue
-            hash_faces = all_faces[frame]
-            for index, face_path in hash_faces.items():
-                hash_faces[index] = hash_image_file(face_path)
-            self.alignments.add_face_hashes(frame, hash_faces)
